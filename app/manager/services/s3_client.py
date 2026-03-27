@@ -41,25 +41,60 @@ def normalize_s3_key_prefix(prefix: str) -> str:
     return p if p.endswith("/") else f"{p}/"
 
 
+def list_s3_object_keys_v2(
+    bucket: str,
+    prefix: str,
+    *,
+    client: Optional[object] = None,
+) -> list[str]:
+    """
+    `list_objects_v2`로 prefix 하위 객체 키를 모두 반환(페이지네이션 포함).
+
+    각 응답에서 `Contents`의 `Key`만 사용:
+
+        [item["Key"] for item in response.get("Contents", []) if item.get("Key")]
+    """
+    c = client or get_s3_client()
+    pfx = normalize_s3_key_prefix(prefix)
+    keys: list[str] = []
+    request: dict = {"Bucket": bucket, "Prefix": pfx}
+
+    while True:
+        response = c.list_objects_v2(**request)
+        contents = response.get("Contents") or []
+        keys.extend(
+            item["Key"] for item in contents if item.get("Key")
+        )
+        if not response.get("IsTruncated"):
+            break
+        token = response.get("NextContinuationToken")
+        if not token:
+            break
+        request = {
+            "Bucket": bucket,
+            "Prefix": pfx,
+            "ContinuationToken": token,
+        }
+
+    return keys
+
+
 def list_s3_image_keys(
     bucket: str,
     prefix: str,
     *,
     client: Optional[object] = None,
 ) -> list[str]:
-    """list_objects_v2로 prefix 하위 이미지 키만 수집(폴더 마커 제외), 키 이름순."""
+    """`list_s3_object_keys_v2` 결과 중 이미지 확장자만 골라 키 이름순으로 반환."""
     c = client or get_s3_client()
-    pfx = normalize_s3_key_prefix(prefix)
+    raw_keys = list_s3_object_keys_v2(bucket, prefix, client=c)
     keys: list[str] = []
-    paginator = c.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=pfx):
-        for obj in page.get("Contents", []) or []:
-            key = obj.get("Key")
-            if not key or key.endswith("/"):
-                continue
-            low = key.lower()
-            if any(low.endswith(ext) for ext in _S3_IMAGE_SUFFIXES):
-                keys.append(key)
+    for key in raw_keys:
+        if key.endswith("/"):
+            continue
+        low = key.lower()
+        if any(low.endswith(ext) for ext in _S3_IMAGE_SUFFIXES):
+            keys.append(key)
     return sorted(keys, key=lambda k: k.lower())
 
 

@@ -6,6 +6,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+_FG_MIN = 128
+
 try:
     from PIL import Image, ImageChops, ImageOps
 except ImportError as exc:  # pragma: no cover
@@ -92,6 +94,8 @@ class DetailPreprocessConfig:
     background_tolerance: int = 18
     """True면 단계별 진행을 콘솔에 출력."""
     verbose: bool = False
+    # 타일 전경 픽셀 최소치; 0이면 max(64, min_segment_height * min_content_pixels_per_row)
+    min_tile_content_pixels: int = 0
 
 
 def _log(cfg: DetailPreprocessConfig, msg: str) -> None:
@@ -157,6 +161,56 @@ def _build_content_mask(image: Image.Image, cfg: DetailPreprocessConfig) -> Imag
         bg = _median_edge_background(image, cfg.background_border_px)
         return _content_mask_rgb(image, bg, cfg.background_tolerance)
     return _content_mask_luminance(image, cfg.white_threshold)
+
+
+def _trim_rgb_to_content_bbox(
+    rgb: Image.Image,
+    cfg: DetailPreprocessConfig,
+    *,
+    log_ctx: str = "",
+) -> Image.Image:
+    """
+    마스크상 전경의 축정렬 bbox(+좌우·상하 margin)로 RGB를 자름.
+
+    세로로 붙인 블록 너비가 달라 캔버스 오른쪽에만 남는 배경 띠를 제거할 때 사용.
+    """
+    iw, ih = rgb.size
+    mask = _build_content_mask(rgb, cfg)
+    bbox = mask.getbbox()
+    if bbox is None:
+        return rgb
+    l, u, r, b = bbox
+    left = max(l - cfg.horizontal_margin_px, 0)
+    upper = max(u - cfg.vertical_margin_px, 0)
+    right = min(r + cfg.horizontal_margin_px, iw)
+    lower = min(b + cfg.vertical_margin_px, ih)
+    if right <= left or lower <= upper:
+        return rgb
+    if (left, upper, right, lower) == (0, 0, iw, ih):
+        return rgb
+    out = rgb.crop((left, upper, right, lower))
+    if out.size != rgb.size:
+        ctx = f"{log_ctx} — " if log_ctx else ""
+        _log(cfg, f"{ctx}내용 박스 트림 {iw}x{ih} → {out.width}x{out.height}px")
+    return out
+
+
+def _effective_min_tile_content_pixels(cfg: DetailPreprocessConfig) -> int:
+    if cfg.min_tile_content_pixels > 0:
+        return cfg.min_tile_content_pixels
+    auto = cfg.min_segment_height * cfg.min_content_pixels_per_row
+    return max(64, auto)
+
+
+def _mask_crop_is_meaningful(mask_crop: Image.Image, min_foreground_pixels: int) -> bool:
+    """타일 영역 마스크에 전경이 충분히 있으면 True."""
+    if mask_crop.mode != "L":
+        mask_crop = mask_crop.convert("L")
+    if mask_crop.getbbox() is None:
+        return False
+    data = mask_crop.tobytes()
+    n = sum(1 for b in data if b >= _FG_MIN)
+    return n >= min_foreground_pixels
 
 
 def _row_content_counts(mask: Image.Image) -> list[int]:
@@ -246,10 +300,21 @@ def _merge_internal_segments(
     if not segments:
         _log(
             cfg,
-            f"{prefix}[4/5] 세로 구간 없음 → 이 파일은 자르지 않고 원본 그대로 사용",
+            f"{prefix}[4/5] 세로 구간 없음 → 가로 방향만 내용 박스에 맞춤",
         )
-        _log(cfg, f"{prefix}[5/5] 결과 크기 {iw}x{ih}px (원본)")
-        return image
+        bbox = content_mask.getbbox()
+        if bbox is None:
+            _log(cfg, f"{prefix}[5/5] 결과 크기 {iw}x{ih}px (원본, 마스크 비어 있음)")
+            return image
+        left = max(bbox[0] - cfg.horizontal_margin_px, 0)
+        right = min(bbox[2] + cfg.horizontal_margin_px, iw)
+        cropped_full = image.crop((left, 0, right, ih))
+        _log(
+            cfg,
+            f"{prefix}[5/5] 결과 크기 {cropped_full.width}x{cropped_full.height}px "
+            f"(가로 crop x=[{left}, {right}))",
+        )
+        return cropped_full
 
     _log(cfg, f"{prefix}[4/5] 세로 내용 구간 {len(segments)}개")
     max_detail = 8
@@ -285,21 +350,265 @@ def _merge_internal_segments(
     canvas = Image.new("RGB", (w, h), "white")
     y = 0
     for p in parts:
-        canvas.paste(p, ((w - p.width) // 2, y))
+        canvas.paste(p, (0, y))
         y += p.height
-    return canvas
+    return _trim_rgb_to_content_bbox(canvas, cfg, log_ctx=prefix.rstrip())
+
+
+class _DSU:
+    """8-connected 아님 4-connected 행 스캔용 union-find."""
+
+    __slots__ = ("_p",)
+
+    def __init__(self) -> None:
+        self._p: list[int] = []
+
+    def make_set(self) -> int:
+        i = len(self._p)
+        self._p.append(i)
+        return i
+
+    def find(self, i: int) -> int:
+        p = self._p
+        while p[i] != i:
+            p[i] = p[p[i]]
+            i = p[i]
+        return i
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self._p[rb] = ra
+
+
+def _mask_row_runs(data: bytes, w: int, y: int) -> list[tuple[int, int]]:
+    """한 행에서 전경(>= _FG_MIN) 구간 (x0, x1), x1 exclusive."""
+    base = y * w
+    runs: list[tuple[int, int]] = []
+    x = 0
+    while x < w:
+        if data[base + x] < _FG_MIN:
+            x += 1
+            continue
+        x0 = x
+        while x < w and data[base + x] >= _FG_MIN:
+            x += 1
+        runs.append((x0, x))
+    return runs
+
+
+def connected_component_bboxes(mask: Image.Image) -> list[tuple[int, int, int, int]]:
+    """
+    이진 L 마스크에서 4-연결 성분별 축정렬 바운딩 박스.
+    각 박스 (x0, y0, x1, y1)는 **포함 경계**(픽셀 좌표).
+    """
+    if mask.mode != "L":
+        mask = mask.convert("L")
+    w, h = mask.size
+    if w <= 0 or h <= 0:
+        return []
+    data = mask.tobytes()
+    dsu = _DSU()
+    prev: list[tuple[int, int, int]] = []
+    stamped: list[tuple[int, int, int, int]] = []
+
+    for y in range(h):
+        runs = _mask_row_runs(data, w, y)
+        curr: list[tuple[int, int, int]] = []
+        for x0, x1 in runs:
+            overlap_labs = [plab for px0, px1, plab in prev if x1 > px0 and x0 < px1]
+            if not overlap_labs:
+                lab = dsu.make_set()
+            else:
+                lab = overlap_labs[0]
+                for pl in overlap_labs[1:]:
+                    dsu.union(lab, pl)
+            curr.append((x0, x1, lab))
+        prev = curr
+        for x0, x1, lab in curr:
+            stamped.append((y, x0, x1, lab))
+
+    bbox_by_root: dict[int, list[int]] = {}
+    for y, x0, x1, lab in stamped:
+        r = dsu.find(lab)
+        if r not in bbox_by_root:
+            bbox_by_root[r] = [x0, y, x1 - 1, y]
+        else:
+            b = bbox_by_root[r]
+            b[0] = min(b[0], x0)
+            b[1] = min(b[1], y)
+            b[2] = max(b[2], x1 - 1)
+            b[3] = max(b[3], y)
+    return [tuple(v) for v in bbox_by_root.values()]
+
+
+def _intersects_range(lo: int, hi_ex: int, b0: int, b1: int) -> bool:
+    """[lo, hi_ex) 와 [b0, b1] (inclusive) 교집합 존재."""
+    return b0 <= hi_ex - 1 and b1 >= lo
+
+
+def _tile_y_intervals(
+    height: int,
+    tile_h: int,
+    bboxes: Sequence[tuple[int, int, int, int]],
+) -> list[tuple[int, int]]:
+    """타일 높이(tile_h) 기준 세로 구간; 가로 경계선이 성분을 가르면 아래쪽 끝까지 확장."""
+    if tile_h <= 0:
+        raise ValueError("tile_h는 양수여야 합니다.")
+    intervals: list[tuple[int, int]] = []
+    y0 = 0
+    while y0 < height:
+        y_ideal = min(y0 + tile_h, height)
+        if y_ideal >= height:
+            intervals.append((y0, height))
+            break
+        y_end = y_ideal
+        while True:
+            extended = False
+            for bx0, by0, bx1, by1 in bboxes:
+                if not _intersects_range(y0, y_end, by0, by1):
+                    continue
+                if by1 >= y_end:
+                    new_end = min(height, by1 + 1)
+                    if new_end > y_end:
+                        y_end = new_end
+                        extended = True
+            if not extended:
+                break
+        intervals.append((y0, y_end))
+        y0 = y_end
+    return intervals
+
+
+def _tile_x_intervals(
+    width: int,
+    tile_w: int,
+    bboxes: Sequence[tuple[int, int, int, int]],
+    y0: int,
+    y1_ex: int,
+) -> list[tuple[int, int]]:
+    """가로 구간; 세로 밴드 [y0, y1_ex) 와 겹치는 성분만 고려. 경계가 성분을 가르면 오른쪽 끝까지 확장."""
+    if tile_w <= 0:
+        raise ValueError("tile_w는 양수여야 합니다.")
+    relevant = [
+        bb
+        for bb in bboxes
+        if _intersects_range(y0, y1_ex, bb[1], bb[3])
+    ]
+    intervals: list[tuple[int, int]] = []
+    x0 = 0
+    while x0 < width:
+        x_ideal = min(x0 + tile_w, width)
+        if x_ideal >= width:
+            intervals.append((x0, width))
+            break
+        x_end = x_ideal
+        while True:
+            extended = False
+            for bx0, by0, bx1, by1 in relevant:
+                if not _intersects_range(x0, x_end, bx0, bx1):
+                    continue
+                if bx1 >= x_end:
+                    new_end = min(width, bx1 + 1)
+                    if new_end > x_end:
+                        x_end = new_end
+                        extended = True
+            if not extended:
+                break
+        intervals.append((x0, x_end))
+        x0 = x_end
+    return intervals
+
+
+def split_merged_image_into_tiles(
+    image: Image.Image,
+    tile_width_px: int,
+    tile_height_px: int,
+    config: DetailPreprocessConfig | None = None,
+) -> list[tuple[Image.Image, int, int]]:
+    """
+    합쳐진 RGB 이미지를 대략 `tile_width_px` × `tile_height_px` 타일로 자름.
+
+    가로/세로 타일 경계가 내용 마스크의 연결 성분을 가르면, 해당 성분의 바운딩 박스
+    경계까지 타일을 넓혀 잘림을 방지합니다(반복 확장으로 연쇄 반영).
+
+    내용 마스크상 전경 픽셀이 `min_tile_content_pixels`(또는 자동 임계값) 미만인 타일은
+    반환 목록에 넣지 않아 저장 단계에서 파일이 생기지 않습니다.
+    """
+    cfg = config or DetailPreprocessConfig()
+    if tile_width_px <= 0 or tile_height_px <= 0:
+        raise ValueError("tile_width_px, tile_height_px는 양수여야 합니다.")
+    rgb = image.convert("RGB")
+    w, h = rgb.size
+    mask = _build_content_mask(rgb, cfg)
+    bboxes = connected_component_bboxes(mask)
+    min_fg = _effective_min_tile_content_pixels(cfg)
+    _log(
+        cfg,
+        f"타일 분할 — 크기 {w}x{h}px, 목표 타일 {tile_width_px}x{tile_height_px}px, "
+        f"내용 성분 {len(bboxes)}개, 타일 최소 전경 픽셀 {min_fg}",
+    )
+
+    tiles: list[tuple[Image.Image, int, int]] = []
+    y_splits = _tile_y_intervals(h, tile_height_px, bboxes)
+    for yi, (y0, y1_ex) in enumerate(y_splits):
+        x_splits = _tile_x_intervals(w, tile_width_px, bboxes, y0, y1_ex)
+        for xi, (x0, x1_ex) in enumerate(x_splits):
+            mcrop = mask.crop((x0, y0, x1_ex, y1_ex))
+            if not _mask_crop_is_meaningful(mcrop, min_fg):
+                _log(
+                    cfg,
+                    f"  타일 row={yi + 1}/{len(y_splits)} col={xi + 1}/{len(x_splits)} "
+                    f"bbox=({x0},{y0})-({x1_ex},{y1_ex}) — 생략(전경 픽셀 < {min_fg})",
+                )
+                continue
+            crop = rgb.crop((x0, y0, x1_ex, y1_ex))
+            tiles.append((crop, yi, xi))
+            _log(
+                cfg,
+                f"  타일 row={yi + 1}/{len(y_splits)} col={xi + 1}/{len(x_splits)} "
+                f"bbox=({x0},{y0})-({x1_ex},{y1_ex}) size={x1_ex - x0}x{y1_ex - y0}px",
+            )
+    return tiles
+
+
+def save_tile_images(
+    tiles: Sequence[tuple[Image.Image, int, int]],
+    output_dir: str | Path,
+    *,
+    stem: str = "tile",
+    format: str = "JPEG",
+    quality: int = 92,
+) -> list[Path]:
+    """타일을 `tile_r001_c001.jpg` 형식으로 저장하고 경로 목록 반환."""
+    d = Path(output_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for im, ri, ci in tiles:
+        p = d / f"{stem}_r{ri + 1:03d}_c{ci + 1:03d}.jpg"
+        im.save(p, format=format, quality=quality)
+        paths.append(p.resolve())
+    return paths
 
 
 def preprocess_detail_images(
     input_image_paths: Sequence[str | Path],
     output_image_path: str | Path,
     config: DetailPreprocessConfig | None = None,
+    *,
+    tile_width_px: int | None = None,
+    tile_height_px: int | None = None,
+    tiles_output_dir: str | Path | None = None,
 ) -> Path:
     """
     여러 상세 이미지를 각각 전처리한 뒤 세로로 하나로 합쳐 저장.
 
     각 파일에 대해: 배경/공백 제거 → 구간별 여백 적용 후 세로 병합,
     그 다음 모든 파일 결과를 `between_images_margin_px` 간격으로 세로 합침.
+
+    `tile_width_px`·`tile_height_px`를 모두 주면 합본 저장 후 같은 마스크 기준으로
+    타일을 나누어 `tiles_output_dir`(기본: 합본 파일과 같은 디렉터리 아래 `tiles`)에 저장합니다.
+    전경 픽셀이 `min_tile_content_pixels` 미만인 타일은 파일로 쓰지 않습니다.
     """
     cfg = config or DetailPreprocessConfig()
     paths = [Path(p) for p in input_image_paths]
@@ -333,12 +642,31 @@ def preprocess_detail_images(
     for i, b in enumerate(blocks):
         if i > 0:
             y += sep
-        canvas.paste(b, ((w - b.width) // 2, y))
+        canvas.paste(b, (0, y))
         y += b.height
 
+    canvas = _trim_rgb_to_content_bbox(canvas, cfg, log_ctx="최종 합성")
     out.parent.mkdir(parents=True, exist_ok=True)
     _log(cfg, f"저장 중… {out.resolve()}")
     canvas.save(out)
+    if tile_width_px is not None and tile_height_px is not None:
+        tdir = (
+            Path(tiles_output_dir)
+            if tiles_output_dir is not None
+            else (out.parent / "tiles")
+        )
+        _log(
+            cfg,
+            f"타일 저장 — {tile_width_px}x{tile_height_px}px 기준 → {tdir.resolve()}",
+        )
+        tiles = split_merged_image_into_tiles(
+            canvas, tile_width_px, tile_height_px, cfg
+        )
+        if tiles:
+            save_tile_images(tiles, tdir, stem=out.stem + "_tile")
+            _log(cfg, f"타일 {len(tiles)}장 저장 완료 (내용 없는 타일은 생략)")
+        else:
+            _log(cfg, "저장할 타일 없음(모든 조각이 전경 임계 미만)")
     _log(cfg, "완료")
     return out
 
@@ -347,12 +675,23 @@ def preprocess_detail_image(
     input_image_path: str | Path,
     output_image_path: str | Path,
     config: DetailPreprocessConfig | None = None,
+    *,
+    tile_width_px: int | None = None,
+    tile_height_px: int | None = None,
+    tiles_output_dir: str | Path | None = None,
 ) -> Path:
     """
     단일 긴 상품 상세 이미지를 전처리해 저장.
     (내부적으로 `preprocess_detail_images` 한 장 분기와 동일 로직)
     """
-    return preprocess_detail_images([input_image_path], output_image_path, config)
+    return preprocess_detail_images(
+        [input_image_path],
+        output_image_path,
+        config,
+        tile_width_px=tile_width_px,
+        tile_height_px=tile_height_px,
+        tiles_output_dir=tiles_output_dir,
+    )
 
 
 if __name__ == "__main__":
@@ -429,6 +768,36 @@ if __name__ == "__main__":
         action="store_true",
         help="단계별 콘솔 로그 끄기",
     )
+    parser.add_argument(
+        "--tile-width",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="합본 저장 후 타일 가로(px). --tile-height와 함께 지정",
+    )
+    parser.add_argument(
+        "--tile-height",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="합본 저장 후 타일 세로(px). --tile-width와 함께 지정",
+    )
+    parser.add_argument(
+        "--tiles-output-dir",
+        type=Path,
+        default=None,
+        help="타일 저장 폴더 (기본: 출력 파일과 같은 부모 아래 tiles/)",
+    )
+    parser.add_argument(
+        "--min-tile-content-pixels",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "타일 내 전경 픽셀이 N 미만이면 파일 생략. 0이면 자동 "
+            "(max(64, min-segment-height × min-content-pixels-per-row))"
+        ),
+    )
     args = parser.parse_args()
 
     input_dir = (args.input_dir or _default_in).resolve()
@@ -474,6 +843,12 @@ if __name__ == "__main__":
             output_path = output_path.resolve()
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    tw, th = args.tile_width, args.tile_height
+    if (tw is None) ^ (th is None):
+        parser.error("--tile-width와 --tile-height는 둘 다 지정하거나 둘 다 생략하세요.")
+    if tw is not None and (tw <= 0 or th <= 0):
+        parser.error("--tile-width / --tile-height는 양수여야 합니다.")
+
     cfg = DetailPreprocessConfig(
         vertical_margin_px=args.vertical_margin,
         between_images_margin_px=args.between_margin,
@@ -485,6 +860,14 @@ if __name__ == "__main__":
         background_tolerance=args.background_tolerance,
         background_border_px=args.background_border,
         verbose=not args.quiet,
+        min_tile_content_pixels=max(0, args.min_tile_content_pixels),
     )
-    out = preprocess_detail_images(input_paths, output_path, cfg)
+    out = preprocess_detail_images(
+        input_paths,
+        output_path,
+        cfg,
+        tile_width_px=tw,
+        tile_height_px=th,
+        tiles_output_dir=args.tiles_output_dir,
+    )
     print(f"saved: {out}", flush=True)
