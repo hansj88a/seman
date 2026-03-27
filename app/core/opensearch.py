@@ -1,19 +1,19 @@
-"""
-공통: OpenSearch 접속만 제공 (agent/manager 각자 검색·인덱싱 로직 보유)
-"""
-from opensearchpy import OpenSearch, RequestsHttpConnection
+"""OpenSearch 클라이언트 — agent/manager 공통."""
+from functools import lru_cache
+from typing import Any, Optional
 
-from app.config import get_settings
+from opensearchpy import OpenSearch
+
+from app.core.config import get_settings
 
 
+@lru_cache
 def get_client() -> OpenSearch:
-    """OpenSearch 클라이언트 생성 (공통)"""
     s = get_settings()
-    kwargs = {
+    kwargs: dict[str, Any] = {
         "hosts": [s.opensearch_host],
         "use_ssl": s.opensearch_host.startswith("https"),
         "verify_certs": True,
-        "connection_class": RequestsHttpConnection,
     }
     if s.opensearch_user and s.opensearch_password:
         kwargs["http_auth"] = (s.opensearch_user, s.opensearch_password)

@@ -8,41 +8,54 @@ Python(FastAPI) 기반 API 서버.
 | **agent** | 검색 API (OpenSearch에서 상품 코드 조회) | public | **8090** |
 | **manager** | 동기화 API (S3 → OpenSearch 등록) | private | **8091** |
 
-## 프로젝트 구조
+## 프로젝트 구조 (정규화)
 
-- **공통**: OpenSearch 접속(`app/core`), 로그 설정(`app/logging_config.py`), 환경 설정(`app/config.py`), **프롬프트 로더**(`app/core/prompt_loader.py`)만 공유.
-- **agent / manager**: 각 패키지가 독립적인 서비스 코드(자체 `services/`)를 가짐.
-- **프롬프트**: 서비스별·용도별로 파일 분리 (`app/prompts/<service>/<name>.txt`). 프로덕션에서 `PROMPTS_DIR`로 외부 경로 지정 가능.
+- **공통**: `app/core/` 에 설정·로깅·OpenSearch·프롬프트 로더 통합.
+- **agent / manager**: 동일 계층 구조 — `main.py`, `routers/`, `services/` 로 일관.
+- **프롬프트**: `app/prompts/<service>/<name>.txt`. 프로덕션에서 `PROMPTS_DIR` 로 외부 경로 지정 가능.
 
 ```
 app/
-  config.py              # 공통 설정
-  logging_config.py      # 공통 로그 (콘솔 + 파일)
-  core/                  # 공통
-    opensearch.py        # get_client()
-    prompt_loader.py     # load_prompt(service, name) — 파일 기반 프롬프트
-  prompts/               # 프롬프트 파일 (서비스별 분리)
+  __init__.py
+  core/                     # 공통 인프라
+    __init__.py
+    config.py                # 환경 설정 (get_settings)
+    logging.py               # 로깅 (get_agent_logger, get_manager_logger, get_exception_location)
+    opensearch.py            # get_client()
+    prompt_loader.py         # load_prompt(service, name)
+  models/                    # API·도메인 모델
+    __init__.py
+    search.py                # SearchQueryParams, SearchResponse
+    sync.py                  # SyncStartResponse
+    index_fields.py          # ProductIndexFields
+  prompts/
     agent/
       query_classifier_system.txt
       query_reconstructor_system.txt
-  models/                # API·인덱스 필드 모델
-    index_fields.py
-    search.py
-    sync.py
-  packages/
-    agent/               # 검색 서비스 (public, 8090) — 독립
-      main.py
-      search.py          # 검색 라우터
-      services/
-        search_service.py   # OpenSearch 검색 로직
-    manager/             # 동기화 서비스 (private, 8091) — 독립
-      main.py
-      sync.py            # 동기화 라우터
-      services/
-        s3_client.py
-        embedding_client.py
-        opensearch_indexer.py
-        sync_service.py
+  agent/                     # 검색 서비스 (public, 8090)
+    __init__.py
+    main.py
+    routers/
+      __init__.py
+      search.py              # GET /api/v1/search
+    services/
+      search_service.py
+      text_normalizer.py
+      morph_analyzer.py
+      query_classifier.py
+      query_reconstructor.py
+      embedding_client.py
+  manager/                   # 동기화 서비스 (private, 8091)
+    __init__.py
+    main.py
+    routers/
+      __init__.py
+      sync.py                # POST /api/v1/sync/start
+    services/
+      s3_client.py
+      embedding_client.py
+      opensearch_indexer.py
+      sync_service.py
 scripts/
   run_agent.bat
   run_manager.bat
@@ -79,7 +92,7 @@ copy .env.example .env
 **1. agent (검색, public, 포트 8090)**
 
 ```bash
-uvicorn app.packages.agent.main:app --reload --host 0.0.0.0 --port 8090
+uvicorn app.agent.main:app --reload --host 0.0.0.0 --port 8090
 # 또는 (Windows)
 scripts\run_agent.bat
 ```
@@ -90,7 +103,7 @@ scripts\run_agent.bat
 **2. manager (동기화, private, 포트 8091)**
 
 ```bash
-uvicorn app.packages.manager.main:app --reload --host 0.0.0.0 --port 8091
+uvicorn app.manager.main:app --reload --host 0.0.0.0 --port 8091
 # 또는 (Windows)
 scripts\run_manager.bat
 ```
@@ -152,7 +165,7 @@ S3 상품 파일 형식: JSON 배열 `[...]` 또는 JSONL (한 줄당 JSON). `pr
 
 ## API 모델 (필드 관리)
 
-요청/응답 필드는 `app/models/` 에서 Pydantic 모델로 관리합니다.
+요청/응답 필드는 `app/models/` 에서 Pydantic 모델로 관리하며, `from app.models import ...` 로 사용합니다.
 
 | 모델 | 서비스 | 용도 |
 |------|--------|------|
@@ -187,6 +200,6 @@ S3 상품 파일 형식: JSON 배열 `[...]` 또는 JSONL (한 줄당 JSON). `pr
 
 ## 프로덕션 환경
 
-- **프롬프트**: LLM용 시스템 프롬프트는 `app/prompts/<service>/<name>.txt` 에서 로드합니다. 배포 시 `PROMPTS_DIR` 을 설정하면 해당 경로를 우선 사용하므로, 코드 배포 없이 프롬프트만 수정·배포할 수 있습니다. (예: `PROMPTS_DIR=/etc/product_semantic_search/prompts`)
+- **프롬프트**: LLM용 시스템 프롬프트는 `app/prompts/<service>/<name>.txt` 에서 로드합니다. 배포 시 `PROMPTS_DIR` 을 설정하면 해당 경로를 우선 사용합니다. (예: `PROMPTS_DIR=/etc/product_semantic_search/prompts`)
 - **로그**: `LOG_DIR`, `LOG_FILE_AGENT`, `LOG_FILE_MANAGER` 로 경로·파일명 제어.
 - **설정**: OpenSearch, S3, Bedrock 등은 `.env` 또는 환경변수로 관리.
