@@ -5,7 +5,6 @@ S3/로컬 이미지 가공 샘플 — 노트북·스크립트 단독 실행용(a
 
 from __future__ import annotations
 
-import argparse
 import os
 from pathlib import Path
 from typing import Optional
@@ -100,6 +99,10 @@ CONTENT_DEBUG_DIR_NAME = "content_debug"
 OUTPUT_DIR = Path("app/data/image/output")
 MERGED_FILE_NAME = "merged_from_s3.jpg"
 TILE_STEM = "content_tile"
+# Input source globals (notebook-friendly; no argparse required)
+RUN_LOCAL_INPUT_DIR: Optional[str] = None
+RUN_S3_KEY: Optional[str] = None
+RUN_S3_BUCKET: Optional[str] = None
 
 # Runtime config guide
 # - Size/split: VALID_IMAGE_TILE_WIDTH, CONTENT_TILE_HEIGHT, SPLIT_OVERLAP_PX, MIN_LAST_TILE_HEIGHT_PX
@@ -622,91 +625,17 @@ def save_outputs(merged: np.ndarray) -> list[Path]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="S3/로컬 이미지 로드 -> 여백 제거/폭 맞춤/병합/세로분할 샘플"
-    )
-    parser.add_argument(
-        "--key",
-        default=None,
-        help="S3 prefix 경로 (예: s3://my-bucket/path/to/detail/ 또는 path/to/detail/)",
-    )
-    parser.add_argument("--bucket", default=None, help="--key가 prefix일 때 사용할 버킷")
-    parser.add_argument(
-        "--local-input-dir",
-        default=None,
-        help="로컬 이미지 디렉터리 (예: app/data/image). 지정 시 S3 대신 로컬 모드 실행",
-    )
-    parser.add_argument("--valid-image-tile-width", type=int, default=VALID_IMAGE_TILE_WIDTH)
-    parser.add_argument("--content-tile-height", type=int, default=CONTENT_TILE_HEIGHT)
-    parser.add_argument("--split-overlap-px", type=int, default=SPLIT_OVERLAP_PX)
-    parser.add_argument(
-        "--min-last-tile-height-px",
-        type=int,
-        default=MIN_LAST_TILE_HEIGHT_PX,
-        help="마지막 타일 높이가 이 값 미만이면 직전 타일에 포함",
-    )
-    parser.add_argument(
-        "--no-edge-background",
-        action="store_true",
-        help="엣지 기반 배경 추정 비활성화(명도 white_threshold만 사용)",
-    )
-    parser.add_argument("--background-border-px", type=int, default=BACKGROUND_BORDER_PX)
-    parser.add_argument(
-        "--background-tolerance",
-        type=int,
-        default=BACKGROUND_TOLERANCE,
-        help="엣지 배경색과 채널 차이가 이 값 초과면 전경(0~255)",
-    )
-    parser.add_argument("--min-repeated-pattern-px-vertical", type=int, default=MIN_REPEATED_PATTERN_PX_VERTICAL)
-    parser.add_argument(
-        "--vertical-trim-max-gray-std",
-        type=float,
-        default=VERTICAL_TRIM_MAX_GRAY_STD,
-        help="상/하 트림: 행 명도 표준편차가 이 값 이하여야 흰 띠로 인정",
-    )
-    parser.add_argument("--min-repeated-pattern-px-horizontal", type=int, default=MIN_REPEATED_PATTERN_PX_HORIZONTAL)
-    parser.add_argument("--pattern-flat-std-threshold-horizontal", type=float, default=PATTERN_FLAT_STD_THRESHOLD_HORIZONTAL)
-    parser.add_argument("--background-tolerance-horizontal", type=int, default=BACKGROUND_TOLERANCE_HORIZONTAL)
-    parser.add_argument("--max-edge-trim-ratio", type=float, default=MAX_EDGE_TRIM_RATIO)
-    parser.add_argument(
-        "--max-edge-trim-ratio-horizontal",
-        type=float,
-        default=MAX_EDGE_TRIM_RATIO_HORIZONTAL,
-        help="좌/우 한쪽에서 최대 트림 가능한 비율(0~0.45)",
-    )
-    parser.add_argument("--content-bbox-min-area-ratio", type=float, default=CONTENT_BBOX_MIN_AREA_RATIO)
-    parser.add_argument("--content-bbox-padding-px", type=int, default=CONTENT_BBOX_PADDING_PX)
-    parser.add_argument("--white-threshold", type=int, default=WHITE_THRESHOLD)
-    parser.add_argument("--output-dir", default=str(OUTPUT_DIR))
-    args = parser.parse_args()
-
-    set_runtime_config(
-        VALID_IMAGE_TILE_WIDTH=max(1, args.valid_image_tile_width),
-        CONTENT_TILE_HEIGHT=max(1, args.content_tile_height),
-        SPLIT_OVERLAP_PX=max(0, args.split_overlap_px),
-        MIN_LAST_TILE_HEIGHT_PX=max(1, args.min_last_tile_height_px),
-        USE_EDGE_BACKGROUND=not args.no_edge_background,
-        BACKGROUND_BORDER_PX=max(1, args.background_border_px),
-        BACKGROUND_TOLERANCE=max(0, args.background_tolerance),
-        MIN_REPEATED_PATTERN_PX_VERTICAL=max(1, args.min_repeated_pattern_px_vertical),
-        VERTICAL_TRIM_MAX_GRAY_STD=max(0.1, args.vertical_trim_max_gray_std),
-        MIN_REPEATED_PATTERN_PX_HORIZONTAL=max(1, args.min_repeated_pattern_px_horizontal),
-        PATTERN_FLAT_STD_THRESHOLD_HORIZONTAL=max(0.1, args.pattern_flat_std_threshold_horizontal),
-        BACKGROUND_TOLERANCE_HORIZONTAL=max(0, args.background_tolerance_horizontal),
-        MAX_EDGE_TRIM_RATIO=max(0.0, min(0.45, args.max_edge_trim_ratio)),
-        MAX_EDGE_TRIM_RATIO_HORIZONTAL=max(0.0, min(0.45, args.max_edge_trim_ratio_horizontal)),
-        CONTENT_BBOX_MIN_AREA_RATIO=max(0.0, min(1.0, args.content_bbox_min_area_ratio)),
-        CONTENT_BBOX_PADDING_PX=max(0, args.content_bbox_padding_px),
-        WHITE_THRESHOLD=max(0, min(255, args.white_threshold)),
-        OUTPUT_DIR=Path(args.output_dir),
-    )
-
+    """
+    Notebook-friendly entrypoint:
+    - parser.parse_args() 없이 전역 설정값을 그대로 사용
+    - 입력 소스는 RUN_LOCAL_INPUT_DIR / RUN_S3_KEY / RUN_S3_BUCKET 전역 변수 사용
+    """
     log("파이프라인 시작")
-    if args.local_input_dir:
-        files, images = get_local_image_list(args.local_input_dir)
+    if RUN_LOCAL_INPUT_DIR:
+        files, images = get_local_image_list(RUN_LOCAL_INPUT_DIR)
         log(f"로드 완료(LOCAL): 파일 개수={len(files)}, image[] 길이={len(images)}")
-    elif args.key:
-        bucket, keys, images = get_image_list(args.key, bucket=args.bucket)
+    elif RUN_S3_KEY:
+        bucket, keys, images = get_image_list(RUN_S3_KEY, bucket=RUN_S3_BUCKET)
         log(f"로드 완료(S3): bucket={bucket}, key 개수={len(keys)}, image[] 길이={len(images)}")
     else:
         default_dir = default_local_image_dir()
@@ -743,17 +672,3 @@ if __name__ == "__main__":
 
 
 
-set_runtime_config(
-    VALID_IMAGE_TILE_WIDTH=800,
-    CONTENT_TILE_HEIGHT=900,
-    SPLIT_OVERLAP_PX=30,
-    MIN_LAST_TILE_HEIGHT_PX=200,
-    OUTPUT_DIR=Path("app/data/image/output"),
-    WHITE_THRESHOLD=245,
-    USE_EDGE_BACKGROUND=True,
-    SAVE_CONTENT_DEBUG_PREVIEW=True,
-)
-files, images = get_local_image_list("app/data/image")
-merged, tiles = process_images(images)
-out_paths = save_outputs(merged)
-print('saved', len(out_paths))
