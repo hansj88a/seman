@@ -30,18 +30,44 @@ def default_data_image_output_dir() -> Path:
     return default_data_image_dir() / "output"
 
 
-def list_images_in_dir(input_dir: Path | None = None) -> list[Path]:
+def list_images_in_dir(
+    input_dir: Path | None = None,
+    *,
+    include_s3_uri: str | None = None,
+    s3_cache_dir: Path | None = None,
+) -> list[Path]:
     """
-    디렉터리 바로 아래의 이미지 파일만 이름순으로 반환(하위 폴더는 순회하지 않음).
-    `output` 폴더 안 파일은 여기서 포함되지 않음.
+     디렉터리 바로 아래의 이미지 파일만 수집한 뒤, 옵션으로 S3 prefix 이미지를
+    내려받은 경로와 합쳐 파일명 기준 정렬해 반환(하위 폴더는 순회하지 않음).
+
+    S3를 섞을 때: `include_s3_uri="s3://bucket/detail/"` 를 주면
+    `list_objects_v2`로 이미지 키를 모은 뒤 `s3_cache_dir`(기본 `input_dir/_s3_include_cache`)에
+    저장하고, 그 로컬 경로를 로컬 파일 목록과 합칩니다.
+
+    코드에서만 쓸 때 예:
+
+        from app.manager.services.s3_client import download_s3_prefix_to_directory, parse_s3_uri
+        paths = list_images_in_dir(Path("./local"))
+        b, p = parse_s3_uri("s3://my-bucket/detail/")
+        paths += download_s3_prefix_to_directory(b, p, Path("./.s3_cache"))
+        paths = sorted(paths, key=lambda x: x.name.lower())
     """
     root = (input_dir or default_data_image_dir()).resolve()
-    if not root.is_dir():
-        return []
     files: list[Path] = []
-    for p in root.iterdir():
-        if p.is_file() and p.suffix.lower() in _IMAGE_EXTENSIONS:
-            files.append(p)
+    if root.is_dir():
+        for p in root.iterdir():
+            if p.is_file() and p.suffix.lower() in _IMAGE_EXTENSIONS:
+                files.append(p.resolve())
+    if include_s3_uri:
+        from app.manager.services.s3_client import (
+            download_s3_prefix_to_directory,
+            parse_s3_uri,
+        )
+
+        bucket, prefix = parse_s3_uri(include_s3_uri)
+        cache = (s3_cache_dir or (root / "_s3_include_cache")).resolve()
+        cache.mkdir(parents=True, exist_ok=True)
+        files.extend(download_s3_prefix_to_directory(bucket, prefix, cache))
     return sorted(files, key=lambda x: x.name.lower())
 
 
@@ -362,6 +388,18 @@ if __name__ == "__main__":
         default=None,
         help=f"입력 디렉터리 (inputs 생략 시 이 경로에서 수집, 기본: {_default_in})",
     )
+    parser.add_argument(
+        "--include-s3",
+        default=None,
+        metavar="S3_URI",
+        help="로컬 목록과 합칠 S3 prefix (예: s3://bucket/detail/). list_objects_v2 후 캐시에 저장",
+    )
+    parser.add_argument(
+        "--s3-cache-dir",
+        type=Path,
+        default=None,
+        help="S3 이미지 다운로드 폴더 (미지정 시 input-dir/_s3_include_cache)",
+    )
     parser.add_argument("--vertical-margin", type=int, default=5, help="블록 내 상하 여백(px)")
     parser.add_argument(
         "--between-margin",
@@ -396,12 +434,28 @@ if __name__ == "__main__":
     input_dir = (args.input_dir or _default_in).resolve()
     if args.inputs:
         input_paths = [Path(p).resolve() for p in args.inputs]
+        if args.include_s3:
+            from app.manager.services.s3_client import (
+                download_s3_prefix_to_directory,
+                parse_s3_uri,
+            )
+
+            sb, sp = parse_s3_uri(args.include_s3)
+            cache = (args.s3_cache_dir or (input_dir / "_s3_include_cache")).resolve()
+            cache.mkdir(parents=True, exist_ok=True)
+            input_paths.extend(download_s3_prefix_to_directory(sb, sp, cache))
+            input_paths = sorted(input_paths, key=lambda p: p.name.lower())
     else:
-        input_paths = list_images_in_dir(input_dir)
+        input_paths = list_images_in_dir(
+            input_dir,
+            include_s3_uri=args.include_s3,
+            s3_cache_dir=args.s3_cache_dir,
+        )
         if not input_paths:
             parser.error(
                 f"입력 이미지가 없습니다. 경로 확인: {input_dir} "
-                f"(확장자: {', '.join(sorted(_IMAGE_EXTENSIONS))})"
+                f"(확장자: {', '.join(sorted(_IMAGE_EXTENSIONS))}), "
+                f"또는 --include-s3 URI 확인"
             )
 
     if args.output is None:
