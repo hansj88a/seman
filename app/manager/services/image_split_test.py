@@ -22,7 +22,11 @@ BACKGROUND_BORDER_PX = 2
 BACKGROUND_TOLERANCE = 18
 MIN_REPEATED_PATTERN_PX_VERTICAL = 40
 VERTICAL_TRIM_MAX_GRAY_STD = 4.0
+VERTICAL_TRIM_EDGE_TOLERANCE = 18
+VERTICAL_TRIM_PATTERN_FLAT_STD = 6.0
+VERTICAL_TRIM_MAX_HORIZ_MEAN_ABS_DIFF = 14.0
 MIN_REPEATED_PATTERN_PX_HORIZONTAL = 40
+HORIZONTAL_TRIM_MAX_GRAY_STD = 5.0
 PATTERN_FLAT_STD_THRESHOLD_HORIZONTAL = 2.0
 BACKGROUND_TOLERANCE_HORIZONTAL = 10
 MAX_EDGE_TRIM_RATIO = 0.18
@@ -43,9 +47,10 @@ TILE_STEM = "content_tile"
 # Runtime config guide
 # - Size/split: VALID_IMAGE_TILE_WIDTH, CONTENT_TILE_HEIGHT, SPLIT_OVERLAP_PX, MIN_LAST_TILE_HEIGHT_PX
 # - Background/content: WHITE_THRESHOLD, USE_EDGE_BACKGROUND, BACKGROUND_BORDER_PX, BACKGROUND_TOLERANCE
-# - Vertical trim(top/bottom): MIN_REPEATED_PATTERN_PX_VERTICAL, VERTICAL_TRIM_MAX_GRAY_STD
-# - Horizontal trim(left/right): MIN_REPEATED_PATTERN_PX_HORIZONTAL,
-#   PATTERN_FLAT_STD_THRESHOLD_HORIZONTAL, BACKGROUND_TOLERANCE_HORIZONTAL
+# - Vertical trim(top/bottom): MIN_REPEATED_PATTERN_PX_VERTICAL, VERTICAL_TRIM_MAX_GRAY_STD,
+#   VERTICAL_TRIM_EDGE_TOLERANCE, VERTICAL_TRIM_PATTERN_FLAT_STD, VERTICAL_TRIM_MAX_HORIZ_MEAN_ABS_DIFF
+# - Horizontal trim(left/right): MIN_REPEATED_PATTERN_PX_HORIZONTAL, HORIZONTAL_TRIM_MAX_GRAY_STD
+#   (PATTERN_FLAT_STD_THRESHOLD_HORIZONTAL, BACKGROUND_TOLERANCE_HORIZONTAL: 레거시, 트림 미사용)
 # - Safety: MAX_EDGE_TRIM_RATIO, MAX_EDGE_TRIM_RATIO_HORIZONTAL,
 #   CONTENT_BBOX_MIN_AREA_RATIO, CONTENT_BBOX_PADDING_PX
 # - Output/debug: OUTPUT_DIR, MERGED_FILE_NAME, TILE_STEM,
@@ -86,57 +91,80 @@ def _median_edge_bgr(image: np.ndarray, border_px: int) -> tuple[int, int, int]:
     )
 
 
-def _row_is_uniform_white_band(row_gray: np.ndarray, white_threshold: int, max_gray_std: float) -> bool:
-    """상/하 트림 전용: 흰 띠(밝고 거의 균일한 행)만 배경."""
-    mean_v = float(np.mean(row_gray))
-    std_v = float(np.std(row_gray))
-    return mean_v >= float(white_threshold) and std_v <= float(max_gray_std)
+def _row_is_vertical_trim_background(
+    row_bgr: np.ndarray,
+    row_gray: np.ndarray,
+    *,
+    white_threshold: int,
+    max_white_gray_std: float,
+    edge_bgr: tuple[int, int, int],
+    edge_tolerance: float,
+    pattern_flat_gray_std: float,
+    max_horiz_mean_abs_diff: float,
+) -> bool:
+    """상/하 트림: 흰 균일 띠, 또는 엣지 색과 유사한 균일·저텍스처(가로) 행을 배경으로 본다."""
+    mean_g = float(np.mean(row_gray))
+    std_g = float(np.std(row_gray))
+    if mean_g >= float(white_threshold) and std_g <= max_white_gray_std:
+        return True
+    rm = row_bgr.mean(axis=0).astype(np.float64)
+    bg = np.array(edge_bgr, dtype=np.float64)
+    slack = 2.0
+    if not bool(np.all(np.abs(rm - bg) <= float(edge_tolerance) + slack)):
+        return False
+    if std_g <= float(pattern_flat_gray_std):
+        return True
+    g64 = row_gray.astype(np.float64)
+    if g64.size > 1:
+        horiz_delta = float(np.mean(np.abs(np.diff(g64))))
+    else:
+        horiz_delta = 0.0
+    return horiz_delta <= float(max_horiz_mean_abs_diff)
 
 
-def _strip_looks_like_background_horizontal(
-    strip_bgr: np.ndarray,
+def _column_is_bright_margin_strip(
     strip_gray: np.ndarray,
     *,
     white_threshold: int,
-    edge_bgr: Optional[tuple[int, int, int]],
-    edge_tolerance: int,
-    flat_std_threshold: float,
+    max_gray_std: float,
 ) -> bool:
-    """좌/우 트림: 밝음·저분산·엣지 배경색 유사."""
+    """좌/우 트림: 밝고 거의 균일한 열만 여백으로 본다."""
     mean_v = float(np.mean(strip_gray))
     std_v = float(np.std(strip_gray))
-    if mean_v >= white_threshold or std_v <= float(flat_std_threshold):
-        return True
-    if edge_bgr is not None:
-        rm = strip_bgr.mean(axis=0)
-        bg = np.array(edge_bgr, dtype=np.float64)
-        if np.all(np.abs(rm - bg) <= float(edge_tolerance) + 2.0):
-            return True
-    return False
+    return mean_v >= float(white_threshold) and std_v <= float(max_gray_std)
 
 
 def _trim_repeated_background_edges(
     image: np.ndarray,
 ) -> np.ndarray:
-    """가장자리 반복 배경 제거. 상하는 균일 흰색만, 좌우는 엣지 색/평탄도 포함."""
+    """가장자리 반복 배경 제거. 상하는 엣지 유사 색·저텍스처 띠, 좌우는 밝은 균일 여백만."""
     h, w = image.shape[:2]
     if h == 0 or w == 0:
         return image
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edge_bgr: Optional[tuple[int, int, int]] = None
-    if USE_EDGE_BACKGROUND:
-        edge_bgr = _median_edge_bgr(image, BACKGROUND_BORDER_PX)
+    edge_bgr_trim = _median_edge_bgr(image, BACKGROUND_BORDER_PX)
     white_threshold = WHITE_THRESHOLD
     min_repeat_v = max(1, int(MIN_REPEATED_PATTERN_PX_VERTICAL))
     min_repeat_h = max(1, int(MIN_REPEATED_PATTERN_PX_HORIZONTAL))
-    std_v_trim = max(0.1, float(VERTICAL_TRIM_MAX_GRAY_STD))
-    std_h = float(PATTERN_FLAT_STD_THRESHOLD_HORIZONTAL)
-    tol_h = max(0, int(BACKGROUND_TOLERANCE_HORIZONTAL))
+    std_v_white = max(0.1, float(VERTICAL_TRIM_MAX_GRAY_STD))
+    edge_tol_v = max(0.0, float(VERTICAL_TRIM_EDGE_TOLERANCE))
+    pattern_flat_v = max(0.1, float(VERTICAL_TRIM_PATTERN_FLAT_STD))
+    horiz_diff_v = max(0.0, float(VERTICAL_TRIM_MAX_HORIZ_MEAN_ABS_DIFF))
+    std_h_margin = max(0.1, float(HORIZONTAL_TRIM_MAX_GRAY_STD))
 
     top = 0
     run = 0
     for y in range(h):
-        if _row_is_uniform_white_band(gray[y, :], white_threshold, std_v_trim):
+        if _row_is_vertical_trim_background(
+            image[y, :],
+            gray[y, :],
+            white_threshold=white_threshold,
+            max_white_gray_std=std_v_white,
+            edge_bgr=edge_bgr_trim,
+            edge_tolerance=edge_tol_v,
+            pattern_flat_gray_std=pattern_flat_v,
+            max_horiz_mean_abs_diff=horiz_diff_v,
+        ):
             run += 1
             if run >= min_repeat_v:
                 top = y + 1
@@ -146,7 +174,16 @@ def _trim_repeated_background_edges(
     bottom = h
     run = 0
     for y in range(h - 1, -1, -1):
-        if _row_is_uniform_white_band(gray[y, :], white_threshold, std_v_trim):
+        if _row_is_vertical_trim_background(
+            image[y, :],
+            gray[y, :],
+            white_threshold=white_threshold,
+            max_white_gray_std=std_v_white,
+            edge_bgr=edge_bgr_trim,
+            edge_tolerance=edge_tol_v,
+            pattern_flat_gray_std=pattern_flat_v,
+            max_horiz_mean_abs_diff=horiz_diff_v,
+        ):
             run += 1
             if run >= min_repeat_v:
                 bottom = y
@@ -156,13 +193,10 @@ def _trim_repeated_background_edges(
     left = 0
     run = 0
     for x in range(w):
-        if _strip_looks_like_background_horizontal(
-            image[:, x],
+        if _column_is_bright_margin_strip(
             gray[:, x],
             white_threshold=white_threshold,
-            edge_bgr=edge_bgr,
-            edge_tolerance=tol_h,
-            flat_std_threshold=std_h,
+            max_gray_std=std_h_margin,
         ):
             run += 1
             if run >= min_repeat_h:
@@ -173,13 +207,10 @@ def _trim_repeated_background_edges(
     right = w
     run = 0
     for x in range(w - 1, -1, -1):
-        if _strip_looks_like_background_horizontal(
-            image[:, x],
+        if _column_is_bright_margin_strip(
             gray[:, x],
             white_threshold=white_threshold,
-            edge_bgr=edge_bgr,
-            edge_tolerance=tol_h,
-            flat_std_threshold=std_h,
+            max_gray_std=std_h_margin,
         ):
             run += 1
             if run >= min_repeat_h:
@@ -605,11 +636,33 @@ def main() -> None:
         "--vertical-trim-max-gray-std",
         type=float,
         default=VERTICAL_TRIM_MAX_GRAY_STD,
-        help="상/하 트림: 행 명도 표준편차가 이 값 이하여야 흰 띠로 인정",
+        help="상/하 트림: 흰 띠로 볼 때 행 명도 표준편차 상한",
+    )
+    parser.add_argument(
+        "--vertical-trim-edge-tolerance",
+        type=float,
+        default=VERTICAL_TRIM_EDGE_TOLERANCE,
+        help="상/하 트림: 행 평균 BGR과 엣지 중앙값 채널 차 상한",
+    )
+    parser.add_argument(
+        "--vertical-trim-pattern-flat-gray-std",
+        type=float,
+        default=VERTICAL_TRIM_PATTERN_FLAT_STD,
+        help="상/하 트림: 엣지 색과 맞을 때 균일 띠로 볼 명도 표준편차 상한",
+    )
+    parser.add_argument(
+        "--vertical-trim-max-horiz-mean-abs-diff",
+        type=float,
+        default=VERTICAL_TRIM_MAX_HORIZ_MEAN_ABS_DIFF,
+        help="상/하 트림: 엣지 색 일치 시 가로 방향 평균 픽셀 차(저텍스처) 상한",
     )
     parser.add_argument("--min-repeated-pattern-px-horizontal", type=int, default=MIN_REPEATED_PATTERN_PX_HORIZONTAL)
-    parser.add_argument("--pattern-flat-std-threshold-horizontal", type=float, default=PATTERN_FLAT_STD_THRESHOLD_HORIZONTAL)
-    parser.add_argument("--background-tolerance-horizontal", type=int, default=BACKGROUND_TOLERANCE_HORIZONTAL)
+    parser.add_argument(
+        "--horizontal-trim-max-gray-std",
+        type=float,
+        default=HORIZONTAL_TRIM_MAX_GRAY_STD,
+        help="좌/우 트림: 밝은 여백 열의 명도 표준편차 상한",
+    )
     parser.add_argument("--max-edge-trim-ratio", type=float, default=MAX_EDGE_TRIM_RATIO)
     parser.add_argument(
         "--max-edge-trim-ratio-horizontal",
@@ -633,9 +686,11 @@ def main() -> None:
         BACKGROUND_TOLERANCE=max(0, args.background_tolerance),
         MIN_REPEATED_PATTERN_PX_VERTICAL=max(1, args.min_repeated_pattern_px_vertical),
         VERTICAL_TRIM_MAX_GRAY_STD=max(0.1, args.vertical_trim_max_gray_std),
+        VERTICAL_TRIM_EDGE_TOLERANCE=max(0.0, args.vertical_trim_edge_tolerance),
+        VERTICAL_TRIM_PATTERN_FLAT_STD=max(0.1, args.vertical_trim_pattern_flat_gray_std),
+        VERTICAL_TRIM_MAX_HORIZ_MEAN_ABS_DIFF=max(0.0, args.vertical_trim_max_horiz_mean_abs_diff),
         MIN_REPEATED_PATTERN_PX_HORIZONTAL=max(1, args.min_repeated_pattern_px_horizontal),
-        PATTERN_FLAT_STD_THRESHOLD_HORIZONTAL=max(0.1, args.pattern_flat_std_threshold_horizontal),
-        BACKGROUND_TOLERANCE_HORIZONTAL=max(0, args.background_tolerance_horizontal),
+        HORIZONTAL_TRIM_MAX_GRAY_STD=max(0.1, args.horizontal_trim_max_gray_std),
         MAX_EDGE_TRIM_RATIO=max(0.0, min(0.45, args.max_edge_trim_ratio)),
         MAX_EDGE_TRIM_RATIO_HORIZONTAL=max(0.0, min(0.45, args.max_edge_trim_ratio_horizontal)),
         CONTENT_BBOX_MIN_AREA_RATIO=max(0.0, min(1.0, args.content_bbox_min_area_ratio)),
