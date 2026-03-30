@@ -13,48 +13,41 @@ from app.core.config import get_settings
 from app.manager.services.s3_client import get_s3_client, list_s3_image_keys, parse_s3_uri
 
 
-# Global runtime configuration
-VALID_IMAGE_TILE_WIDTH = 800
-CONTENT_TILE_HEIGHT = 900
-WHITE_THRESHOLD = 245
-USE_EDGE_BACKGROUND = True
-BACKGROUND_BORDER_PX = 2
-BACKGROUND_TOLERANCE = 18
+# Global runtime configuration (런타임에 set_runtime_config(...)로 덮어쓸 수 있음)
+VALID_IMAGE_TILE_WIDTH = 800  # 타일(콘텐츠)의 목표 가로 픽셀 — 폭 맞춤/리사이즈 기준
+CONTENT_TILE_HEIGHT = 900  # 세로 분할 시 한 조각의 기준 높이(px)
+WHITE_THRESHOLD = 245  # 명도 이상이면 배경/흰 여백에 가깝다고 보는 임계값(0~255, _content_mask 및 좌우 트림)
+USE_EDGE_BACKGROUND = True  # True면 가장자리 색으로 배경 추정, False면 WHITE_THRESHOLD만으로 전경 마스크
+BACKGROUND_BORDER_PX = 2  # 엣지 색 중앙값 계산 시 사용하는 테두리 두께(px)
+BACKGROUND_TOLERANCE = 18  # 엣지 배경색과 BGR 채널 차가 이 값 초과면 전경으로 보는 허용 오차
+# 상·하 트림: 위/아래에서 "배경 행"이 최소 몇 행(높이 px) 연속이어야 잘라낼지.
+# - 기본 40이면: 맨 위(또는 맨 아래)에서 배경으로 인정되는 행이 40행 연속일 때만 트림 시작.
+# - 그 후 같은 방향으로 배경 행이 이어지면 연속 배경 구간 끝까지 잘라냄(첫 비배경 행에서 중단).
+# - 연속 배경이 이 값 미만이면 해당 변은 전혀 자르지 않음.
 MIN_REPEATED_PATTERN_PX_VERTICAL = 40
-VERTICAL_TRIM_MAX_GRAY_STD = 4.0
-VERTICAL_TRIM_EDGE_TOLERANCE = 18
-VERTICAL_TRIM_PATTERN_FLAT_STD = 6.0
-VERTICAL_TRIM_MAX_HORIZ_MEAN_ABS_DIFF = 14.0
+VERTICAL_TRIM_MAX_GRAY_STD = 4.0  # 상·하: "흰 띠" 판별 시 행 명도 표준편차 상한(이하면 균일로 봄)
+VERTICAL_TRIM_EDGE_TOLERANCE = 18  # 상·하: 행 평균 BGR과 엣지 중앙값 BGR 채널 차 허용값
+VERTICAL_TRIM_PATTERN_FLAT_STD = 6.0  # 상·하: 엣지 색과 맞을 때 "균일 띠"로 볼 명도 표준편차 상한
+VERTICAL_TRIM_MAX_HORIZ_MEAN_ABS_DIFF = 14.0  # 상·하: 엣지 색 일치 시 행 내 가로 픽셀 차 평균 상한(저텍스처/미세 패턴)
+# 좌·우 트림: 왼쪽/오른쪽에서 밝은 여백 "열"이 최소 몇 열(폭 px) 연속이어야 잘라낼지(상·하와 동일한 run 로직)
 MIN_REPEATED_PATTERN_PX_HORIZONTAL = 40
-HORIZONTAL_TRIM_MAX_GRAY_STD = 5.0
-PATTERN_FLAT_STD_THRESHOLD_HORIZONTAL = 2.0
-BACKGROUND_TOLERANCE_HORIZONTAL = 10
-MAX_EDGE_TRIM_RATIO = 0.18
-MAX_EDGE_TRIM_RATIO_HORIZONTAL = 0.08
-CONTENT_BBOX_MIN_AREA_RATIO = 0.05
-CONTENT_BBOX_PADDING_PX = 12
-ROW_CONTENT_THRESHOLD = 1
-MIN_CONTENT_SEGMENT_HEIGHT = 2
-INTER_TILE_MARGIN = 0
-SPLIT_OVERLAP_PX = 30
-MIN_LAST_TILE_HEIGHT_PX = 200
-SAVE_CONTENT_DEBUG_PREVIEW = True
-CONTENT_DEBUG_DIR_NAME = "content_debug"
-OUTPUT_DIR = Path("app/data/image/output")
-MERGED_FILE_NAME = "merged_from_s3.jpg"
-TILE_STEM = "content_tile"
-
-# Runtime config guide
-# - Size/split: VALID_IMAGE_TILE_WIDTH, CONTENT_TILE_HEIGHT, SPLIT_OVERLAP_PX, MIN_LAST_TILE_HEIGHT_PX
-# - Background/content: WHITE_THRESHOLD, USE_EDGE_BACKGROUND, BACKGROUND_BORDER_PX, BACKGROUND_TOLERANCE
-# - Vertical trim(top/bottom): MIN_REPEATED_PATTERN_PX_VERTICAL, VERTICAL_TRIM_MAX_GRAY_STD,
-#   VERTICAL_TRIM_EDGE_TOLERANCE, VERTICAL_TRIM_PATTERN_FLAT_STD, VERTICAL_TRIM_MAX_HORIZ_MEAN_ABS_DIFF
-# - Horizontal trim(left/right): MIN_REPEATED_PATTERN_PX_HORIZONTAL, HORIZONTAL_TRIM_MAX_GRAY_STD
-#   (PATTERN_FLAT_STD_THRESHOLD_HORIZONTAL, BACKGROUND_TOLERANCE_HORIZONTAL: 레거시, 트림 미사용)
-# - Safety: MAX_EDGE_TRIM_RATIO, MAX_EDGE_TRIM_RATIO_HORIZONTAL,
-#   CONTENT_BBOX_MIN_AREA_RATIO, CONTENT_BBOX_PADDING_PX
-# - Output/debug: OUTPUT_DIR, MERGED_FILE_NAME, TILE_STEM,
-#   SAVE_CONTENT_DEBUG_PREVIEW, CONTENT_DEBUG_DIR_NAME
+HORIZONTAL_TRIM_MAX_GRAY_STD = 5.0  # 좌·우: 여백으로 볼 열의 명도 표준편차 상한(밝고 거의 균일)
+PATTERN_FLAT_STD_THRESHOLD_HORIZONTAL = 2.0  # 레거시 전역 유지용(가장자리 트림 로직에서는 미사용)
+BACKGROUND_TOLERANCE_HORIZONTAL = 10  # 레거시 전역 유지용(가장자리 트림 로직에서는 미사용)
+MAX_EDGE_TRIM_RATIO = 0.18  # 상·하 한쪽에서 잘라낼 수 있는 최대 비율(이미지 높이 대비 상한)
+MAX_EDGE_TRIM_RATIO_HORIZONTAL = 0.08  # 좌·우 한쪽에서 잘라낼 수 있는 최대 비율(이미지 폭 대비)
+CONTENT_BBOX_MIN_AREA_RATIO = 0.05  # 콘텐츠 bbox가 이미지 면적 대비 이 비율 미만이면 bbox 무시
+CONTENT_BBOX_PADDING_PX = 12  # 콘텐츠 bbox에 추가할 여백(px)
+ROW_CONTENT_THRESHOLD = 1  # 한 행을 "전경이 있다"고 볼 최소 전경 픽셀 수
+MIN_CONTENT_SEGMENT_HEIGHT = 2  # 의미 있는 세로 구간으로 인정할 최소 높이(행)
+INTER_TILE_MARGIN = 0  # 타일 사이 간격(현재 파이프라인에서 사용 값)
+SPLIT_OVERLAP_PX = 30  # 세로 분할 시 다음 타일과 겹치게 가져올 픽셀 수
+MIN_LAST_TILE_HEIGHT_PX = 200  # 마지막 타일 높이가 이 미만이면 직전 타일에 흡수
+SAVE_CONTENT_DEBUG_PREVIEW = True  # True면 콘텐츠 디버그 미리보기 이미지 저장
+CONTENT_DEBUG_DIR_NAME = "content_debug"  # 디버그 출력 하위 디렉터리 이름
+OUTPUT_DIR = Path("app/data/image/output")  # 결과 저장 루트
+MERGED_FILE_NAME = "merged_from_s3.jpg"  # 병합 단일 파일 이름
+TILE_STEM = "content_tile"  # 분할 타일 파일명 접두 (예: content_tile_001.jpg)
 
 
 def set_runtime_config(**kwargs: object) -> None:
@@ -137,7 +130,13 @@ def _column_is_bright_margin_strip(
 def _trim_repeated_background_edges(
     image: np.ndarray,
 ) -> np.ndarray:
-    """가장자리 반복 배경 제거. 상하는 엣지 유사 색·저텍스처 띠, 좌우는 밝은 균일 여백만."""
+    """가장자리 반복 배경 제거. 상·하는 엣지 유사 색·저텍스처 띠, 좌·우는 밝은 균일 여백만.
+
+    상·하 트림 높이(반복 판단):
+    - MIN_REPEATED_PATTERN_PX_VERTICAL 은 "패턴 주기"가 아니라 **연속 배경 행 개수** 기준이다.
+    - 예: 기본값 40이면 윗쪽에서 배경 행이 **40행 연속**이어야 그 이후(연속 배경 전체)를 잘라낸다.
+    - 39행만 배경이고 바로 본문이면 상단은 자르지 않는다.
+    """
     h, w = image.shape[:2]
     if h == 0 or w == 0:
         return image
